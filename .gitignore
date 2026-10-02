@@ -9,7 +9,11 @@ dist/
 # from dist/, and failing that crates/libflac-prebuilt-sys/build.rs downloads what it needs from
 # the latest release. Nothing about which bytes are correct is stored here — that travels with
 # the archives, as SHA256SUMS and each archive's own MANIFEST.
-crates/libflac-prebuilt-sys/prebuilt/
+#
+# The directory itself is kept (an empty .gitkeep): build.rs watches it with
+# `rerun-if-changed`, and a path that does not exist reruns a build script on every build.
+crates/libflac-prebuilt-sys/prebuilt/*
+!crates/libflac-prebuilt-sys/prebuilt/.gitkeep
 target/
 Cargo.lock
 
