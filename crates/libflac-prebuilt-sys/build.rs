@@ -36,6 +36,7 @@
 // The release is not pinned in this source: `resolve` asks where `latest` points, then downloads
 // both files from that named release so they cannot resolve to different releases. The asset name
 // carries the libFLAC version, so a release of a *different* version is rejected before download.
+// It asks when this script runs, which cargo decides: see the `rerun-if-changed` lines in `main`.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -71,6 +72,15 @@ fn main() {
     // `DEP_FLAC_INCLUDE` that `links = "FLAC"` exposes.
     println!("cargo:include={}", manifest.join("include").display());
     println!("cargo:rerun-if-changed={}", lib_dir.join(archive).display());
+    // And the local cache, whichever path won: `resolve` prefers `prebuilt/<target>/` over a
+    // download, so a `./sync-prebuilt.sh` run after a build that linked a cached release has to
+    // make this script run again. `prebuilt/.gitkeep` is committed because a path that does not
+    // exist reruns the script on every build.
+    //
+    // A *release* published since is not something cargo can be told to watch: this script runs
+    // again only when one of the paths or the variable above changes, so a build that already
+    // resolved an archive keeps it. `cargo clean -p libflac-prebuilt-sys` is what asks again.
+    println!("cargo:rerun-if-changed={}", manifest.join("prebuilt").display());
 
     // `cargo:info`, not `cargo:warning`: this is the normal case, and a warning on every build
     // of every consumer is noise that teaches people to ignore warnings. Visible under

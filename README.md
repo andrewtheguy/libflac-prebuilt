@@ -127,6 +127,11 @@ cargo run --release -p libflac-e2e
 `workflow_dispatch` on **Build libFLAC** away. On Windows it runs under a bash (Git's or MSYS2's)
 inside a VS developer environment, with LLVM's `bin` on PATH.
 
+A build that has already resolved an archive keeps it: cargo runs `build.rs` again when
+`prebuilt/`, `flac.env` or `LIBFLAC_PREBUILT_DIR` changes, and not when a new release is
+published. `cargo clean -p libflac-prebuilt-sys` in the consuming project makes the next build
+ask which release is latest.
+
 `./sync-prebuilt.sh --fetch` pulls the latest release's archives instead, for working offline
 afterwards or for a target this machine cannot build. `LIBFLAC_PREBUILT_DIR=/prefix` is the one
 variable a consumer ever sets, and it is never required: it points `build.rs` at an archive you

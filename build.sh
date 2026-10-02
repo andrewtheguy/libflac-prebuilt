@@ -73,8 +73,11 @@ ensure_source
 # No install prefix in here, and that is deliberate: it is the one argument whose value is this
 # machine's absolute path, and the MANIFEST records this list. `cmake --install --prefix` takes
 # it instead.
+#
+# `CMAKE_INSTALL_LIBDIR=lib` because FLAC installs through GNUInstallDirs, which answers `lib64`
+# on the distributions that use it, and the collect step below looks in `lib`.
 cmake_args=(
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_LIBDIR=lib
   -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
   -DWITH_OGG=OFF -DENABLE_MULTITHREADING=OFF
   -DWITH_FORTIFY_SOURCE=OFF -DWITH_STACK_PROTECTOR=OFF
