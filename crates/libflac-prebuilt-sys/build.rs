@@ -1,0 +1,599 @@
+// Find the prebuilt libFLAC for this target and emit the link flags. What this build script
+// does *not* do is the point of the crate: no cmake, no vendored source tree, no `cc`, no
+// pkg-config, and no libclang — and the binary it goes into loads no shared library.
+//
+// Three places an archive can come from, tried in this order:
+//
+//   1. `LIBFLAC_PREBUILT_DIR` — a prefix you built or unpacked yourself. Used as-is.
+//   2. `prebuilt/<target>/` next to this file — what `./build.sh` + `./sync-prebuilt.sh`
+//      leave behind, and gitignored, because a committed `.a` is one nobody can tell apart
+//      from the one CI made.
+//   3. the repository's **latest** GitHub release, downloaded into
+//      `$CARGO_HOME/libflac-prebuilt/<release tag>/` — one directory per release, so a
+//      build links the archives of the release current when it runs rather than whichever
+//      one this machine happened to download first.
+//
+// (3) is what makes a fresh clone of a consuming project build with nothing installed;
+// (1) is what makes it work with no network at all.
+//
+// Two things get hashed on the way in, and neither hash is committed to this repository:
+//
+//   - the downloaded `.tar.gz`, against the `SHA256SUMS` asset the release job generates from
+//     the archives it just built and publishes beside them;
+//   - the extracted `.a`, against the `sha256(library)` line in the MANIFEST inside the
+//     archive — on every resolution path, not just the download.
+//
+// Both are **corruption** checks, not tamper checks: each list travels with the files it
+// covers, so whoever could replace one could replace both. They earn their place because
+// corruption is what actually happens — a truncated download, a cache half-written by a killed
+// build, an `.a` overwritten by hand — and each of those otherwise surfaces as a page of
+// undefined symbols rather than one sentence naming the file.
+//
+// The pin that constrains somebody *other than us* is the third-party one: flac.env pins the
+// checksum of FLAC's release tarball and build.sh refuses to unpack anything else, because
+// that is the supply chain this repository does not control.
+//
+// The release is not pinned in this source: `resolve` asks where `latest` points, then downloads
+// both files from that named release so they cannot resolve to different releases. The asset name
+// carries the libFLAC version, so a release of a *different* version is rejected before download.
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn main() {
+    println!("cargo:rerun-if-env-changed=LIBFLAC_PREBUILT_DIR");
+
+    // Before anything is hashed for real — see the note on the function.
+    check_sha256_implementation();
+
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let target = std::env::var("TARGET").unwrap();
+    let version = flac_env(&manifest, "FLAC_VERSION");
+    println!("cargo:rustc-env=LIBFLAC_PREBUILT_VERSION={version}");
+
+    let (prefix, provenance) = resolve(&manifest, &target, &version);
+    let lib_dir = prefix.join("lib");
+    // MSVC's convention for a static archive, and the name rustc looks for on that target:
+    // `static=FLAC` resolves to `FLAC.lib` there and to `libFLAC.a` everywhere else.
+    let archive = if target.contains("windows-msvc") { "FLAC.lib" } else { "libFLAC.a" };
+    assert!(
+        lib_dir.join(archive).exists(),
+        "no {archive} in {} (from {provenance})\n\nLIBFLAC_PREBUILT_DIR must name a prefix \
+         *containing* lib/, not the lib/ directory itself.",
+        lib_dir.display(),
+    );
+    let manifest_text = verify_library(&prefix, &lib_dir.join(archive), &provenance);
+
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-lib=static=FLAC");
+    link_libm(&target, manifest_text.as_deref(), &provenance);
+
+    // For a consumer compiling its own C against the same headers, via the
+    // `DEP_FLAC_INCLUDE` that `links = "FLAC"` exposes.
+    println!("cargo:include={}", manifest.join("include").display());
+    println!("cargo:rerun-if-changed={}", lib_dir.join(archive).display());
+
+    // `cargo:info`, not `cargo:warning`: this is the normal case, and a warning on every build
+    // of every consumer is noise that teaches people to ignore warnings. Visible under
+    // `cargo build -vv`, which is where the README says to look.
+    println!("cargo:info=libFLAC {version} linked statically from {provenance} ({target})");
+    if let Some(text) = manifest_text.as_deref() {
+        // The CPU floor and the SIMD count, echoed into the log of the build that produced the
+        // binary — which is where anyone asking "why is this encoder slow on this machine"
+        // will look first. The second line is also where the Windows archive says its one
+        // compiler-vectorised kernel came out vectorised.
+        for line in
+            text.lines().filter(|l| l.starts_with("cpu_floor") || l.starts_with("simd_evidence"))
+        {
+            println!("cargo:info=libFLAC {line}");
+        }
+    }
+    if provenance == "LIBFLAC_PREBUILT_DIR" {
+        // This one earns a warning: the archive came from outside the repo, so nothing checked
+        // its version, its CPU floor, or what it was configured with.
+        println!(
+            "cargo:warning=libFLAC from LIBFLAC_PREBUILT_DIR ({}) — unverified",
+            prefix.display()
+        );
+    }
+}
+
+/// Emit the libm link flag where one is needed.
+///
+/// libFLAC's windows and bit estimates call `cosf`, `exp`, `log` and `lround`, so on a platform
+/// where libm is a separate library this is not optional — without it a consumer gets undefined
+/// references to a handful of C functions and no hint about which library holds them. `build.sh` measures the
+/// archive's undefined symbols and writes `libm required: …` or `libm none` into the MANIFEST,
+/// and this reads the answer rather than assuming it stays true.
+///
+/// Not emitted on Apple targets whatever the measurement says: libm is part of libSystem
+/// there, `-lm` resolves to a stub shim that exists only for compatibility, and Rust's own std
+/// already links libSystem.
+///
+/// An archive with no MANIFEST (only `LIBFLAC_PREBUILT_DIR` may lack one) gets the conservative
+/// answer, because an unnecessary `-lm` on a glibc target is a no-op while a missing one is a
+/// link failure.
+fn link_libm(target: &str, manifest_text: Option<&str>, provenance: &str) {
+    if target.contains("apple") {
+        println!("cargo:info=libFLAC needs libm, which is part of libSystem on this target");
+        return;
+    }
+    // The CRT that every Rust binary on that target already links carries them; there is no
+    // `m.lib` to name, and naming one is a link error.
+    if target.contains("windows") {
+        println!("cargo:info=libFLAC needs libm, which is part of the CRT on this target");
+        return;
+    }
+
+    let measured =
+        manifest_text.and_then(|text| text.lines().find_map(|line| line.strip_prefix("libm ")));
+    let needed = match measured {
+        Some("none") => {
+            println!("cargo:info=libFLAC needs no libm (measured at build time)");
+            false
+        }
+        Some(other) => {
+            println!("cargo:info=libFLAC needs libm — {other}");
+            true
+        }
+        None => {
+            println!(
+                "cargo:warning=no libm line in the MANIFEST (from {provenance}) — linking \
+                 libm to be safe"
+            );
+            true
+        }
+    };
+    if needed {
+        println!("cargo:rustc-link-lib=dylib=m");
+    }
+}
+
+/// Hash the archive on disk and require it to be what its own MANIFEST says was built. Returns
+/// the MANIFEST text, since every later step wants to read a line out of it.
+///
+/// Runs on every resolution path, not just the download: the cache is the copy most likely to
+/// be wrong, because it survives across builds and nothing else ever looks at it again.
+/// Hashing half a megabyte costs a couple of milliseconds and turns a corrupt file into a
+/// sentence instead of a page of undefined symbols.
+fn verify_library(prefix: &Path, library: &Path, provenance: &str) -> Option<String> {
+    let text = match std::fs::read_to_string(prefix.join("MANIFEST")) {
+        Ok(text) => text,
+        // A prefix from outside this repository is the only one allowed to arrive without a
+        // MANIFEST, and main() already warns that nothing about it has been checked.
+        Err(_) if provenance == "LIBFLAC_PREBUILT_DIR" => return None,
+        Err(e) => panic!(
+            "no readable MANIFEST in {} (from {provenance}): {e}\n\nEvery archive this \
+             repository publishes carries one.",
+            prefix.display(),
+        ),
+    };
+    let expected = text
+        .lines()
+        .find_map(|line| line.strip_prefix("sha256(library) "))
+        .unwrap_or_else(|| {
+            panic!("no sha256(library) line in the MANIFEST at {}", prefix.display())
+        })
+        .trim();
+
+    let bytes =
+        std::fs::read(library).unwrap_or_else(|e| panic!("cannot read {}: {e}", library.display()));
+    let actual = sha256_hex(&bytes);
+    // A hand-written panic rather than assert_eq!, whose own "left: … right: …" tail would
+    // repeat both hashes underneath a message that already lays them out readably.
+    if actual != expected {
+        panic!(
+            "\n\n{} does not match the MANIFEST beside it (from {provenance}).\n\
+             \x20 MANIFEST says {expected}\n\
+             \x20 the file is  {actual}\n\n\
+             The archive is corrupt or was modified after it was built. Delete the directory \
+             above and build again.\n",
+            library.display(),
+        );
+    }
+    println!("cargo:info=libFLAC sha256(library) {actual} matches the MANIFEST");
+    Some(text)
+}
+
+/// SHA-256 (FIPS 180-4), by hand.
+///
+/// The alternatives are a crate — which every consumer would then compile, in a `-sys` crate
+/// whose entire selling point is that it builds nothing — or shelling out to a different tool
+/// per platform (`shasum`, `sha256sum`, `certutil`), none of which is guaranteed to exist
+/// wherever cargo does. Fifty lines with a test vector beats both.
+fn sha256_hex(bytes: &[u8]) -> String {
+    #[rustfmt::skip]
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    // Pad to a multiple of 64 bytes: a 1 bit, zeros, then the length in bits, big-endian.
+    let mut msg = Vec::with_capacity(bytes.len() + 72);
+    msg.extend_from_slice(bytes);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&(bytes.len() as u64 * 8).to_be_bytes());
+
+    for block in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (word, src) in w.iter_mut().zip(block.chunks_exact(4)) {
+            *word = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, add) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *slot = slot.wrapping_add(add);
+        }
+    }
+
+    h.iter().map(|word| format!("{word:08x}")).collect()
+}
+
+fn resolve(manifest: &Path, target: &str, version: &str) -> (PathBuf, String) {
+    if let Some(dir) = std::env::var_os("LIBFLAC_PREBUILT_DIR") {
+        return (PathBuf::from(dir), "LIBFLAC_PREBUILT_DIR".into());
+    }
+
+    let name = prebuilt_dir(target);
+    let local = manifest.join("prebuilt").join(name);
+    if local.join("lib").is_dir() {
+        return (local, format!("prebuilt/{name}"));
+    }
+
+    // `latest` is a moving pointer, so the cache is keyed by what it currently points at rather
+    // than by the library version. Two releases of the same libFLAC carry different archives —
+    // an option changed, a patch applied, a flag corrected — and a cache directory named after the
+    // version alone answers for every one of them forever: whichever release this machine
+    // downloaded first is the one every later build links, and the symptom is a feature quietly
+    // missing rather than a failure. Keyed by the release tag, last month's archives are simply a
+    // different directory from this month's, and asking which release `latest` is costs one
+    // redirect with no body.
+    let repo = flac_env(manifest, "PREBUILT_REPO");
+    let Some(tag) = latest_release_tag(&repo) else {
+        return offline_cache(name, version);
+    };
+    // The asset name carries the version, so a version the releases have moved past would
+    // otherwise surface as a 404 on a URL nobody typed. Said here, where both halves are known.
+    assert!(
+        tag.starts_with(&format!("v{version}-")),
+        "the latest release of {repo} is {tag}, which is not libFLAC {version} — the version \
+         this crate builds against. Depend on a tag of this repository whose release is the \
+         current one, or set LIBFLAC_PREBUILT_DIR to a prefix you built yourself."
+    );
+
+    let cached = cache_root().join(&tag).join(name);
+    if cached.join("lib").is_dir() {
+        return (cached, format!("cache/{tag}/{name}"));
+    }
+
+    (fetch(&repo, name, version, &tag, &cached), format!("{tag} asset for {name}"))
+}
+
+/// Which release `latest` is, right now.
+///
+/// `https://github.com/<repo>/releases/latest` redirects to `…/releases/tag/<tag>`, so the answer
+/// is the Location header and nothing else is transferred: a HEAD, no body, and none of
+/// `api.github.com`'s sixty-requests-an-hour ceiling for the unauthenticated. The alternative is
+/// asking the API and parsing JSON, in a build script whose whole selling point is that it
+/// compiles no dependencies.
+///
+/// `None` means **cannot ask**, never *no release*: cargo was told it is offline, or curl could
+/// not reach GitHub, or the redirect was not one of these. The caller then falls back to the
+/// newest release this machine already has, and the provenance line says that is what happened.
+fn latest_release_tag(repo: &str) -> Option<String> {
+    if std::env::var("CARGO_NET_OFFLINE").as_deref() == Ok("true") {
+        println!("cargo:info=cargo is offline — using the newest cached release of libFLAC");
+        return None;
+    }
+
+    let url = format!("https://github.com/{repo}/releases/latest");
+    let out = Command::new("curl")
+        .args(["-sS", "--fail", "--head", "--max-time", "30", "--retry", "2", &url])
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run curl: {e}"));
+
+    // A warning rather than a panic: a network that did not answer must not fail a build that
+    // has a usable archive, and a warning rather than nothing because the archive it falls back
+    // to may be older than what is published — which is the whole failure this keying exists to
+    // end, and it should never happen quietly.
+    let stale = |why: String| {
+        println!(
+            "cargo:warning=cannot ask {repo} which release is latest ({why}) — falling back to \
+             the newest cached libFLAC archive, which may be out of date"
+        );
+        None
+    };
+    if !out.status.success() {
+        return stale(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    // Read the header instead of asking curl's `--write-out` for `redirect_url`: the curl 8.8.0
+    // shipped in Windows Server returns CURLE_BAD_FUNCTION_ARGUMENT (43) for every `-w`, even
+    // though this same HEAD succeeds. A reverse search also selects the final response if a
+    // proxy prepends its own header block.
+    let headers = String::from_utf8_lossy(&out.stdout);
+    let Some(location) = headers.lines().rev().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("location").then_some(value.trim())
+    }) else {
+        return stale(format!("{url} returned no Location header"));
+    };
+    let Some((_, tag)) = location.rsplit_once("/releases/tag/") else {
+        return stale(format!("{url} redirected to '{location}'"));
+    };
+    // The tag becomes a directory name below, so it may not be one that names somewhere else.
+    if tag.is_empty() || tag.starts_with('.') || tag.contains(['/', '\\']) {
+        return stale(format!("'{tag}' is not a usable directory name"));
+    }
+    Some(tag.to_string())
+}
+
+/// The newest cached release of this version, for a machine that cannot ask which one is current.
+///
+/// A tag's stamp is a fixed-width UTC timestamp (`v{version}-YYYYMMDDHHMMSS-<short sha>`), so
+/// within one version the tags sort lexicographically in the order the releases happened and the
+/// maximum is the newest archive set this machine holds. It can still be behind what the
+/// repository has published — that is the unavoidable cost of not being able to look, and it is
+/// why the provenance says so rather than reading like a fresh download.
+fn offline_cache(name: &str, version: &str) -> (PathBuf, String) {
+    let root = cache_root();
+    let prefix = format!("v{version}-");
+    let newest = std::fs::read_dir(&root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let tag = entry.file_name().to_string_lossy().into_owned();
+            (tag.starts_with(&prefix) && root.join(&tag).join(name).join("lib").is_dir())
+                .then_some(tag)
+        })
+        .max();
+
+    match newest {
+        Some(tag) => {
+            let path = root.join(&tag).join(name);
+            (path, format!("cache/{tag}/{name}, not revalidated"))
+        }
+        None => panic!(
+            "no cached libFLAC {version} for {name}, and which release is current cannot \
+             be asked. Run ./build.sh {name} && ./sync-prebuilt.sh, or set LIBFLAC_PREBUILT_DIR \
+             to a prefix containing lib/."
+        ),
+    }
+}
+
+/// Download one target's archive from a named release and unpack it into the cache.
+fn fetch(repo: &str, name: &str, version: &str, tag: &str, cached: &Path) -> PathBuf {
+    let asset = format!("libflac-{version}-{name}.tar.gz");
+    let base = format!("https://github.com/{repo}/releases/download/{tag}");
+
+    // Staged under a pid-suffixed name so two cargo builds racing here cannot read each other's
+    // half-written tarball. The loser of the race throws its copy away below.
+    let staging = cached.with_extension(format!("tmp{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).expect("cannot create the cache directory");
+    let tarball = staging.join(&asset);
+    let sums = staging.join("SHA256SUMS");
+
+    println!("cargo:info=fetching {base}/{asset}");
+    if !curl(&format!("{base}/{asset}"), &tarball) {
+        panic!("cannot download {base}/{asset}");
+    }
+    // Both URLs name the same release rather than resolving `latest` a second time, so a
+    // release published while the archive is in flight cannot swap it out from under the
+    // checksums that are about to be read.
+    if !curl(&format!("{base}/SHA256SUMS"), &sums) {
+        panic!(
+            "cannot download {base}/SHA256SUMS
+
+Every release publishes one beside the \
+             archives. If {tag} predates that, run this repository's release workflow \
+             again, or set LIBFLAC_PREBUILT_DIR to a prefix you built yourself."
+        );
+    }
+    verify_download(&sums, &asset, &tarball, tag);
+
+    // `tar` rather than a Rust tar crate: it is present on macOS, on every Linux image that can
+    // run cargo, and in System32 on Windows 10 1803 and later, and a build dependency here
+    // would be one every consumer compiles.
+    run(Command::new("tar").arg("xzf").arg(&tarball).arg("-C").arg(&staging));
+    std::fs::remove_file(&tarball).ok();
+    std::fs::remove_file(&sums).ok();
+
+    std::fs::create_dir_all(cached.parent().unwrap()).ok();
+    if std::fs::rename(&staging, cached).is_err() {
+        // Either another build populated the cache first — fine, use theirs — or the rename
+        // genuinely failed, which the caller's `lib/` check will report.
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    cached.to_path_buf()
+}
+
+/// The downloaded tarball against the SHA256SUMS published beside it on the same release.
+///
+/// Same standing as the MANIFEST check and for the same reason — the list travels with the
+/// files it covers — so this catches a truncated or mangled download, not a dishonest release.
+/// It replaces relying on `tar` to notice: gzip's CRC does catch corruption, but it reports it
+/// as "unexpected end of file" from a program the user did not know was running, which is a
+/// worse sentence than this one.
+fn verify_download(sums: &Path, asset: &str, tarball: &Path, tag: &str) {
+    let text = std::fs::read_to_string(sums).expect("cannot read the downloaded SHA256SUMS");
+    // coreutils writes `<hex>  <name>`, and `sha256sum ./*.tar.gz` would prefix the name with
+    // `./` — accepted here so that how the release job spelled its glob cannot break every
+    // consumer's build.
+    let expected = text
+        .lines()
+        .find_map(|line| {
+            let (hash, rest) = line.split_once(char::is_whitespace)?;
+            (rest.trim().trim_start_matches("./") == asset).then_some(hash)
+        })
+        .unwrap_or_else(|| panic!("SHA256SUMS on {tag} does not list {asset}:\n{text}"));
+
+    let bytes = std::fs::read(tarball).expect("cannot read the downloaded archive");
+    let actual = sha256_hex(&bytes);
+    if actual != expected {
+        panic!(
+            "\n\n{asset} does not match the SHA256SUMS published beside it.\n\
+             \x20 SHA256SUMS says {expected}\n\
+             \x20 the download is {actual}\n\n\
+             The download is corrupt, or a release was published while it was in flight. Try \
+             again.\n"
+        );
+    }
+    println!("cargo:info=libFLAC {asset} matches SHA256SUMS ({actual})");
+}
+
+/// `curl` one URL into one file, reporting whether it worked rather than dying, so that each
+/// caller can say what a failure means.
+fn curl(url: &str, out: &Path) -> bool {
+    Command::new("curl")
+        .args(["-sSL", "--fail", "--max-time", "300", "--retry", "3", "-o"])
+        .arg(out)
+        .arg(url)
+        .status()
+        .unwrap_or_else(|e| panic!("cannot run curl: {e}"))
+        .success()
+}
+
+fn run(cmd: &mut Command) {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    match cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!("{program} failed: {status}"),
+        Err(e) => panic!("cannot run {program}: {e}"),
+    }
+}
+
+/// `$CARGO_HOME/libflac-prebuilt/<release tag>/`, one directory per release, so the download
+/// happens once per machine rather than once per project — and so the many Docker builds that
+/// already cache `~/.cargo` get it for free with no extra configuration.
+fn cache_root() -> PathBuf {
+    let home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".cargo")))
+        .expect("neither CARGO_HOME nor a home directory is set");
+    home.join("libflac-prebuilt")
+}
+
+/// The repo's target names are not Rust triples — they name *artifacts*, and several triples
+/// map to one artifact.
+fn prebuilt_dir(target: &str) -> &'static str {
+    match target {
+        "aarch64-apple-darwin" => "macos-arm64",
+        "x86_64-unknown-linux-gnu" => "linux-x86_64",
+        "aarch64-unknown-linux-gnu" => "linux-aarch64",
+        // Not the glibc archive under another name. The encoder's and the decoder's own
+        // objects reference `fopen64`, `fseeko64` and `ftello64` — measured, on the archive —
+        // and musl stopped offering those names to a link in 1.2.4.
+        "x86_64-unknown-linux-musl" | "aarch64-unknown-linux-musl" => panic!(
+            "no prebuilt libFLAC for musl: the Linux archives are built against glibc and \
+             reference its 64-bit file calls. Set LIBFLAC_PREBUILT_DIR to a prefix holding a \
+             libFLAC.a built for musl."
+        ),
+        "x86_64-apple-darwin" => panic!(
+            "no prebuilt libFLAC for Intel macOS: the macOS artifact is arm64. Set \
+             LIBFLAC_PREBUILT_DIR to a prefix holding your own libFLAC.a, or add the target to \
+             build.sh."
+        ),
+        // Built by clang-cl for the MSVC ABI against the dynamic CRT, which is what Rust's
+        // MSVC target links.
+        "x86_64-pc-windows-msvc" => "windows-x86_64-msvc",
+        "x86_64-pc-windows-gnu" => panic!(
+            "no prebuilt libFLAC for the MinGW target: the Windows archive is an MSVC-ABI \
+             `FLAC.lib` against the dynamic CRT, which a GNU-ABI link cannot use. Build with the \
+             x86_64-pc-windows-msvc target, or set LIBFLAC_PREBUILT_DIR to a prefix holding \
+             your own libFLAC.a."
+        ),
+        other => panic!(
+            "no prebuilt libFLAC for {other}. Supported: aarch64-apple-darwin, \
+             x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, \
+             x86_64-pc-windows-msvc. Set LIBFLAC_PREBUILT_DIR to a prefix holding your own \
+             libFLAC.a for anything else."
+        ),
+    }
+}
+
+/// Read one setting out of `flac.env`, which is where the shell build keeps the same values —
+/// parsed rather than duplicated, so the two halves of this repository cannot disagree about
+/// which libFLAC this is or where its archives live.
+fn flac_env(manifest: &Path, key: &str) -> String {
+    let env_file = manifest.join("../../flac.env");
+    println!("cargo:rerun-if-changed={}", env_file.display());
+    let text = std::fs::read_to_string(&env_file).unwrap_or_else(|e| {
+        panic!("cannot read {}: {e} — is this crate outside its repository?", env_file.display())
+    });
+    let prefix = format!("{key}=");
+    text.lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no {key} in flac.env"))
+        .trim()
+        .to_string()
+}
+
+/// Check the hash against FIPS 180-4's published vectors, on every build.
+///
+/// Not a `#[cfg(test)] mod tests`, and that is the whole point of this comment. Cargo builds a
+/// build script as a *binary it runs*, never as a test target — so a `#[test]` in this file is
+/// compiled by nothing and run by nothing, and `cargo test` reports it as zero tests passing
+/// while looking exactly like success. Fifty lines of hand-written hash guarded by a test that
+/// does not exist is worse than fifty lines with no test at all, because the second kind gets
+/// read carefully.
+///
+/// So it runs unconditionally, before the first hash that decides anything. Three short vectors
+/// plus one megabyte of `'a'` — the long one is what exercises multi-block padding, the part
+/// most likely to be wrong and least likely to show up on short inputs. The whole check costs
+/// about a millisecond, once per build of this crate.
+fn check_sha256_implementation() {
+    for (input, expected) in [
+        (Vec::new(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        (b"abc".to_vec(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        (
+            b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq".to_vec(),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+        ),
+        (vec![b'a'; 1_000_000], "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"),
+    ] {
+        let actual = sha256_hex(&input);
+        assert_eq!(
+            actual,
+            expected,
+            "this build script's SHA-256 is wrong on a published test vector ({} bytes of \
+             input). Every archive integrity check in this file is meaningless until that is \
+             fixed.",
+            input.len(),
+        );
+    }
+}

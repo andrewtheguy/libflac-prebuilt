@@ -1,0 +1,18 @@
+# The Rust half of this repository: an FFI crate that links the prebuilt archives ./build.sh
+# produces, instead of asking every consumer to install libFLAC or to load it at run time.
+#
+# Two members rather than one. The second is not a library at all — it is a *consumer*, built
+# and run by the pipeline on every target, because linking an archive into a binary that
+# encodes a stream and decodes it back bit for bit is a different claim from compiling a test.
+#
+# There is deliberately no safe-wrapper crate. The project this was built for keeps its own,
+# shaped by how a desktop's sound is framed, and a wrapper general enough for everyone would
+# be a worse fit for it than the raw calls.
+[workspace]
+members = ["crates/libflac-prebuilt-sys", "crates/libflac-e2e"]
+resolver = "2"
+
+[workspace.package]
+# Not FLAC's version — that is in flac.env, and a consumer pins this by git tag anyway.
+# This number moves when the *crates* change shape.
+version = "0.1.0"

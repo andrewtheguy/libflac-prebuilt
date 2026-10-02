@@ -1,0 +1,265 @@
+name: Release libFLAC archives
+
+# Manual, and separate from build.yml on purpose: "does this build and pass" is a question worth
+# asking at any time, and it should not require being committed to a release to ask it. This
+# workflow answers the other question, and it answers it by *calling* build.yml rather than
+# repeating it — so the archives that get published are the ones that passed the same tests, run
+# by the same code, and a failure anywhere in there means no release.
+#
+# Draft first, publish last. The property that buys: **a draft release does not create the git
+# tag.** Everything — four builds, their link tests, the e2e binaries, the reproducibility
+# check, packaging, upload — happens while the tag still does not exist, and the tag appears only
+# when the draft is published at the very end. A cancelled or failed release leaves a deletable
+# draft rather than a tag pointing at archives nobody should link.
+#
+# The tag is *computed*, never typed: `v<libFLAC>-<YYYYMMDDHHMMSS>-<short sha>`. The version says
+# what is inside, the timestamp says when, and the hash says which commit — and because this job
+# derives all three from the tree it is building, none of them can disagree with it.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+      stamp: ${{ steps.tag.outputs.stamp }}
+      is_prerelease: ${{ steps.tag.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Determine the tag
+        id: tag
+        run: |
+          . ./flac.env
+          # flac.env is hand-edited, and every asset filename is built from this value, so a
+          # typo here becomes a release full of misnamed archives that no consumer's build.rs can
+          # find.
+          echo "$FLAC_VERSION" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$' || {
+            echo "::error::FLAC_VERSION in flac.env is not a version: '$FLAC_VERSION'"
+            exit 1
+          }
+          # And the checksum pin. A short or mistyped one would make source.sh's check fail on
+          # every runner, which is a slower way to learn the same thing.
+          echo "$FLAC_SHA256" | grep -Eq '^[0-9a-f]{64}$' || {
+            echo "::error::FLAC_SHA256 in flac.env is not a sha256: '$FLAC_SHA256'"
+            exit 1
+          }
+          # `$GITHUB_SHA` rather than `git rev-parse --short HEAD`: it is the commit this run is
+          # building, by definition, and it needs neither a .git directory nor a checkout deep
+          # enough to have one.
+          [ ${#GITHUB_SHA} -eq 40 ] || {
+            echo "::error::GITHUB_SHA is not a full sha: '$GITHUB_SHA'"
+            exit 1
+          }
+          # The build stamp, and the tag built from it — in that order, and both exported,
+          # because the release title wants the stamp on its own and deriving it back out of the
+          # finished tag is how a title ends up with its version in it twice.
+          #
+          # Seconds, not just the date: two releases on one day would otherwise sort by nothing
+          # useful, the only thing distinguishing them being a commit hash with no order to it. A
+          # full timestamp sorts lexicographically, which is the order they happened. UTC, so it
+          # does not depend on the timezone of whoever pressed the button.
+          stamp="$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA:0:7}"
+          tag="v${FLAC_VERSION}-${stamp}"
+          # Never `latest` off a branch: a release built from anything but the default branch is
+          # a prerelease.
+          is_prerelease=false
+          [ "$GITHUB_REF_NAME" = "${{ github.event.repository.default_branch }}" ] || is_prerelease=true
+
+          echo "releasing $tag from $GITHUB_REF_NAME (prerelease=$is_prerelease)"
+          echo "version=${FLAC_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "stamp=${stamp}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${is_prerelease}" >> "$GITHUB_OUTPUT"
+
+      # Vestigial now that the stamp carries seconds — two runs of this workflow cannot collide
+      # unless they start in the same second on the same commit. Kept because it costs one
+      # request and the thing it guards against is a tag silently moving.
+      - name: Abort if the tag already exists
+        run: |
+          if git ls-remote --tags origin "refs/tags/${{ steps.tag.outputs.tag }}" | grep -q .; then
+            echo "::error::Tag ${{ steps.tag.outputs.tag }} already exists."
+            exit 1
+          fi
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # A leftover draft from a failed run is the only thing that can collide, since a draft
+          # never created a tag for the check above to have found.
+          if gh release view "${{ steps.tag.outputs.tag }}" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx true; then
+            echo "Deleting stale draft ${{ steps.tag.outputs.tag }}"
+            gh release delete "${{ steps.tag.outputs.tag }}" --yes
+          fi
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --draft \
+            --target "${{ github.sha }}" \
+            --title "libFLAC ${{ steps.tag.outputs.version }} static archives - ${{ steps.tag.outputs.stamp }}" \
+            --generate-notes \
+            ${{ steps.tag.outputs.is_prerelease == 'true' && '--prerelease' || '' }}
+
+  # Every target, built and tested by the same workflow the manual test loop uses. Not a copy of
+  # it — the same file.
+  archives:
+    needs: prepare
+    uses: ./.github/workflows/build.yml
+    with:
+      targets: all
+
+  publish:
+    needs: [prepare, archives]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # No `merge-multiple`: each target's artifact is a *tree* (lib/, include/, MANIFEST) and
+      # they must stay in separate directories to be packaged separately.
+      - name: Download the archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: libflac-*
+          path: artifacts
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p dist
+          # Named here rather than discovered, so that a target silently missing from the matrix
+          # is a failed release instead of a release somebody links against six months later and
+          # finds nothing for their platform.
+          expected="macos-arm64 linux-x86_64 linux-aarch64 windows-x86_64-msvc"
+          for target in $expected; do
+            dir="artifacts/libflac-$target"
+            [ -f "$dir/MANIFEST" ] || {
+              echo "::error::no archive for $target — refusing to publish an incomplete release"
+              exit 1
+            }
+            tar czf "dist/libflac-${VERSION}-${target}.tar.gz" -C "$dir" .
+          done
+
+          # SHA256SUMS, generated here and published as an asset — never committed. GitHub does
+          # record a sha256 digest per asset, but only through `api.github.com`, which is a
+          # second request, rate-limited to 60/hour for anyone unauthenticated, and JSON that a
+          # zero-dependency build.rs would have to parse. An asset beside the archives is one
+          # more plain GET from the URL it is already using.
+          #
+          # It is a corruption check, not a tamper check: it lives on the same release as the
+          # files it covers, so it proves the download arrived intact, not that the release is
+          # honest. The pin that constrains a party other than us is FLAC_SHA256, checked
+          # against FLAC's release tarball before a compiler runs.
+          (cd dist && sha256sum -- *.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+          ls -l dist
+
+      - name: Upload the assets to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload "${{ needs.prepare.outputs.tag }}" \
+            dist/SHA256SUMS dist/*.tar.gz --clobber
+
+      - name: Add the consumer notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          # Appended to the generated commit list rather than replacing it: the commits say what
+          # changed, and this says what to do about it. Anyone arriving at this release wants the
+          # second thing and will not find it in a diff.
+          gh release view "$TAG" --json body --jq '.body' > notes.md
+          cat >> notes.md <<EOF
+
+          ---
+
+          ## Using these from Rust
+
+          \`\`\`toml
+          flac-sys = { package = "libflac-prebuilt-sys", git = "https://github.com/${GITHUB_REPOSITORY}", tag = "${TAG}" }
+          \`\`\`
+
+          \`[lib] name = "flac_sys"\`, so the calls read \`flac_sys::FLAC__stream_encoder_new()\`.
+          Nothing needs pinning beyond the tag: \`build.rs\` fetches the archive for its target
+          from this repository's latest release, so a consuming project picks up a new archive by
+          updating its git dependency and nothing else.
+
+          ## What is in the archive
+
+          libFLAC, whole, and only it: no \`flac\` or \`metaflac\`, no libFLAC++. **No Ogg** and
+          **no encoder threads** — both configured out, and the build asserts the archive
+          references neither libogg nor pthreads. A project that needs either wants its own
+          build; point \`LIBFLAC_PREBUILT_DIR\` at the prefix.
+
+          ## No toolchain, and nothing loaded at run time
+
+          A consumer needs no cmake, no pkg-config and no libclang — the bindings are committed,
+          generated from the headers in \`include/FLAC/\` and checked against them in CI — and
+          the binary it builds depends on no \`libFLAC\` shared library. On Linux \`build.rs\`
+          emits \`-lm\`, because the build *measures* that libFLAC calls \`cosf\`, \`exp\`,
+          \`log\` and \`lround\`; on Apple targets libm is part of libSystem and on Windows of
+          the CRT. \`cxx_runtime\` is \`none\` on every target.
+
+          ## CPU floors — deliberately none
+
+          The x86_64 archives name **no** CPU floor. libFLAC gives each SSE2..AVX2 and FMA
+          kernel its own target attribute and picks between them *at run time*, so the archive
+          runs on any x86-64 and uses AVX2 and FMA where the CPU has them. What the build
+          asserts instead is that the kernels the encoder dispatches to are in the archive by
+          name, and — by reading its instructions — that the FMA autocorrelation, the one
+          kernel left to the compiler to vectorise, was vectorised.
+
+          \`macos-arm64\` is built with a deployment target of **macOS 11.0**, verified by
+          reading it back off the finished archive.
+
+          ## Windows
+
+          \`windows-x86_64-msvc\` is \`FLAC.lib\`: MSVC-ABI objects against the **dynamic
+          CRT** — the one Rust's \`x86_64-pc-windows-msvc\` target links — read back off the
+          objects' \`/DEFAULTLIB\` directives. It is compiled by **clang-cl with strict
+          aliasing**, not by cl: without type-based aliasing the FMA autocorrelation stays
+          scalar and the encoder runs at a third to a half of the speed of FLAC's own Windows
+          release. It has its own committed bindings file, because a C enum is always
+          \`int\` to the MSVC ABI. Not byte-reproducible, so this target's
+          \`sha256(library)\` is not comparable across builds.
+
+          ## Checking what you downloaded
+
+          \`\`\`
+          curl -sSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/SHA256SUMS
+          sha256sum -c SHA256SUMS --ignore-missing
+          \`\`\`
+
+          \`build.rs\` does the same thing automatically for the archive it fetches, then hashes
+          the extracted library against the \`sha256(library)\` line in that archive's own
+          MANIFEST. Both are corruption checks — SHA256SUMS is published on the same release as
+          the files it covers — and both need no API call.
+
+          \`sha256(library)\` is also the interesting one to compare *between* releases. On
+          \`linux-x86_64\` the pipeline builds twice and requires the two to match, so two
+          releases of the same libFLAC with the same flags list the same hash.
+
+          ## Licensing
+
+          libFLAC is **BSD-3-Clause** (\`COPYING.Xiph\`), shipped in every archive beside
+          \`AUTHORS\` and at the repository root. The \`flac\` and \`metaflac\` programs are
+          GPL and are not built or shipped.
+          EOF
+          gh release edit "$TAG" --notes-file notes.md
+
+      # Last, and only now does the git tag come into existence.
+      - name: Publish (removes the draft, creates the tag)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release edit "${{ needs.prepare.outputs.tag }}" --draft=false
+          echo "published ${{ needs.prepare.outputs.tag }}"

@@ -1,0 +1,10 @@
+[package]
+name = "libflac-e2e"
+version.workspace = true
+edition = "2021"
+description = "Encodes synthetic sound with the prebuilt libFLAC and decodes it back bit for bit, so the pipeline proves the archive works rather than that it links"
+license = "BSD-3-Clause"
+publish = false
+
+[dependencies]
+flac-sys = { package = "libflac-prebuilt-sys", path = "../libflac-prebuilt-sys" }
